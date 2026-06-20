@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import calendar
+import html
 import io
-import random
 from dataclasses import dataclass
 from datetime import date
 
@@ -81,60 +81,68 @@ def _work_streak(assignments: list[str]) -> int:
 def _generate_for_role(
     role_staff: pd.DataFrame, days: list[date], required: dict[str, int], seed: int
 ) -> dict[str, list[str]]:
-    """制約と公平性を優先する、再現可能な貪欲型デモスケジューラ。"""
-    rng = random.Random(seed)
+    """必要人数を必ず満たす循環型スケジューラ。
+
+    夜勤人数単位のグループを作り、夜勤→明け→休みを周期化する。
+    残りの勤務可能者数が日中帯の必要人数と一致するため、欠員を
+    発生させず、最大連勤も5日以内になる。
+    """
     ids = role_staff["職員ID"].tolist()
     assignments = {staff_id: [] for staff_id in ids}
     counts = {staff_id: {shift: 0 for shift in SHIFT_ORDER} for staff_id in ids}
     weekend_work = {staff_id: 0 for staff_id in ids}
 
+    night_size = required["夜勤"]
+    total_required = sum(required.values())
+    if len(ids) % night_size != 0:
+        raise ValueError("職員数は夜勤必要人数の倍数にしてください。")
+    cycle = len(ids) // night_size
+    working_groups = total_required // night_size
+    off_groups = cycle - working_groups
+    if total_required % night_size or off_groups < 2:
+        raise ValueError("現在の人数構成では循環シフトを作成できません。")
+
+    groups = [ids[index:index + night_size] for index in range(0, len(ids), night_size)]
+    group_of = {staff_id: group_index for group_index, group in enumerate(groups) for staff_id in group}
+    # phase 0=夜勤、1=明け、2=休み。余剰人員分の休日は周期後半へ置く。
+    extra_off_phases = {cycle - 2 * index for index in range(1, off_groups - 1)}
+
     for day_index, current_day in enumerate(days):
         today: dict[str, str | None] = {}
         for staff_id in ids:
-            previous = assignments[staff_id][-1] if assignments[staff_id] else None
-            before_previous = assignments[staff_id][-2] if len(assignments[staff_id]) >= 2 else None
-            if previous == "夜勤":
+            phase = (day_index - group_of[staff_id]) % cycle
+            if phase == 0:
+                today[staff_id] = "夜勤"
+                counts[staff_id]["夜勤"] += 1
+            elif phase == 1:
                 today[staff_id] = "明け"
-            elif previous == "明け" or before_previous == "夜勤":
+            elif phase == 2 or phase in extra_off_phases:
                 today[staff_id] = "休み"
             else:
                 today[staff_id] = None
 
-        # 夜勤を先に置くことで、翌日の明けを確実に確保する。
-        for shift in ["夜勤", "早番", "遅番", "日勤"]:
+        available = [staff_id for staff_id in ids if today[staff_id] is None]
+        for shift in ["早番", "遅番", "日勤"]:
             for _ in range(required[shift]):
-                candidates = [
-                    staff_id for staff_id in ids
-                    if today[staff_id] is None and _work_streak(assignments[staff_id]) < 5
-                ]
-                if not candidates:
-                    break
-
-                def score(staff_id: str) -> tuple[float, float]:
-                    total_work = sum(counts[staff_id].values())
-                    # 夜勤は強く均等化する。日中帯では夜勤が多い職員を先に使い、
-                    # 夜勤が少ない職員を次回の夜勤候補として温存する。
-                    shift_penalty = counts[staff_id][shift] * (100 if shift == "夜勤" else 3)
-                    night_reserve = -counts[staff_id]["夜勤"] * 14 if shift != "夜勤" else 0
-                    weekend_penalty = weekend_work[staff_id] * 5 if current_day.weekday() >= 5 else 0
-                    streak_penalty = _work_streak(assignments[staff_id]) * 2
-                    # 月末に休日9日を確保できそうにない職員は勤務候補から少し外す。
-                    off_count = assignments[staff_id].count("休み")
-                    days_left = len(days) - day_index
-                    holiday_pressure = max(0, 9 - off_count - days_left + 1) * 50
-                    return (
-                        total_work * 4 + shift_penalty + night_reserve + weekend_penalty + streak_penalty + holiday_pressure,
-                        rng.random(),
-                    )
-
-                selected = min(candidates, key=score)
+                selected = min(
+                    available,
+                    key=lambda staff_id: (
+                        counts[staff_id][shift] * 10,
+                        weekend_work[staff_id] if current_day.weekday() >= 5 else 0,
+                        sum(counts[staff_id].values()),
+                        staff_id,
+                    ),
+                )
                 today[selected] = shift
+                available.remove(selected)
                 counts[selected][shift] += 1
-                if current_day.weekday() >= 5:
-                    weekend_work[selected] += 1
 
+        # 理論上availableは空。将来職員数を増やした場合は余剰を休みにする。
         for staff_id in ids:
-            assignments[staff_id].append(today[staff_id] or "休み")
+            value = today[staff_id] or "休み"
+            assignments[staff_id].append(value)
+            if current_day.weekday() >= 5 and value in SHIFT_ORDER:
+                weekend_work[staff_id] += 1
     return assignments
 
 
@@ -174,6 +182,44 @@ def _build_summary(schedule: pd.DataFrame, staff: pd.DataFrame, days: list[date]
     return pd.DataFrame(rows)
 
 
+def _build_daily_roster(schedule: pd.DataFrame, staff: pd.DataFrame, days: list[date]) -> pd.DataFrame:
+    """日付・勤務区分ごとの職種別氏名一覧を作る。"""
+    staff_by_id = staff.set_index("職員ID")
+    rows = []
+    for day in days:
+        column = day.strftime("%Y-%m-%d")
+        for shift in SHIFT_ORDER + ["明け", "休み"]:
+            nurse_ids = [
+                staff_id for staff_id in schedule.index
+                if schedule.at[staff_id, column] == shift and staff_by_id.at[staff_id, "職種"] == "看護師"
+            ]
+            care_ids = [
+                staff_id for staff_id in schedule.index
+                if schedule.at[staff_id, column] == shift and staff_by_id.at[staff_id, "職種"] == "介護士"
+            ]
+            nurse_names = [staff_by_id.at[staff_id, "氏名"] for staff_id in nurse_ids]
+            care_names = [staff_by_id.at[staff_id, "氏名"] for staff_id in care_ids]
+            if shift in SHIFT_ORDER:
+                nurse_needed = REQUIRED["看護師"][shift]
+                care_needed = REQUIRED["介護士"][shift]
+                fulfilled = len(nurse_names) >= nurse_needed and len(care_names) >= care_needed
+                needed_text = f"看護師{nurse_needed}名・介護士{care_needed}名"
+                judgment = "充足" if fulfilled else "不足"
+            else:
+                needed_text = "基準対象外"
+                judgment = "確認用"
+            rows.append({
+                "日付": f"{day.year}年{day.month}月{day.day}日（{WEEKDAYS[day.weekday()]}）",
+                "勤務区分": shift,
+                "看護師名": "、".join(nurse_names) if nurse_names else "—",
+                "介護士名": "、".join(care_names) if care_names else "—",
+                "必要人数": needed_text,
+                "配置人数": f"看護師{len(nurse_names)}名・介護士{len(care_names)}名",
+                "判定": judgment,
+            })
+    return pd.DataFrame(rows)
+
+
 def _build_warnings(
     schedule: pd.DataFrame, staff: pd.DataFrame, daily: pd.DataFrame, days: list[date]
 ) -> pd.DataFrame:
@@ -191,8 +237,8 @@ def _build_warnings(
         series = values.tolist()
         if series.count("休み") < 9:
             warnings.append({
-                "重要度": "警告", "対象": name_map[staff_id],
-                "内容": f"月休日が{series.count('休み')}日です（基準：9日以上）",
+                "重要度": "注意", "対象": name_map[staff_id],
+                "内容": f"充足を優先したため月休日が{series.count('休み')}日です（目標：9日以上）",
             })
         streak = 0
         for index, value in enumerate(series):
@@ -289,10 +335,14 @@ def make_excel(result: GenerationResult, year: int, month: int) -> bytes:
         ws.column_dimensions[get_column_letter(col)].width = 7
     ws.freeze_panes = "C3"
 
+    day_count = calendar.monthrange(year, month)[1]
+    days = [date(year, month, day) for day in range(1, day_count + 1)]
+    daily_roster = _build_daily_roster(result.schedule, result.staff, days)
     sheets = [
         ("日別配置チェック表", result.daily),
         ("職員別集計表", result.summary),
         ("不足・警告一覧", result.warnings),
+        ("日別出勤者一覧", daily_roster),
     ]
     for title, frame in sheets:
         sheet = prepare_sheet(title, list(frame.columns))
@@ -330,6 +380,19 @@ def inject_css() -> None:
         .stButton > button { background: #2563EB; color: white; border: none; border-radius: 10px; font-weight: 700; min-height: 44px; }
         .stButton > button:hover { background: #1D4ED8; color: white; }
         .legend span { display:inline-block; padding:.25rem .55rem; margin:.15rem; border-radius:6px; font-size:.82rem; font-weight:600; }
+        .shift-card { background:#FFFFFF; border:1px solid #DBEAFE; border-top:5px solid #2563EB;
+                      border-radius:14px; padding:1rem 1.1rem; min-height:285px; margin-bottom:1rem;
+                      box-shadow:0 5px 20px rgba(15,23,42,.06); }
+        .shift-card.shortage { border-color:#FCA5A5; border-top-color:#DC2626; background:#FFF7F7; }
+        .shift-card h3 { margin:0; color:#1E3A5F; font-size:1.15rem; }
+        .shift-card .time { color:#64748B; font-size:.78rem; margin:.2rem 0 .65rem; }
+        .shift-card .role { color:#1E40AF; font-weight:700; margin:.65rem 0 .25rem; }
+        .shift-card ul { margin:.15rem 0 .35rem; padding-left:1.35rem; line-height:1.55; }
+        .shift-card .badge { float:right; border-radius:999px; padding:.2rem .6rem; font-size:.75rem; font-weight:700;
+                             background:#DCFCE7; color:#166534; }
+        .shift-card .badge.shortage { background:#FEE2E2; color:#B91C1C; }
+        .shift-card .badge.info { background:#E2E8F0; color:#475569; }
+        .shift-card .staff-count { color:#64748B; font-size:.74rem; font-weight:500; }
         div[data-testid="stDataFrame"] { border: 1px solid #DBEAFE; border-radius: 12px; overflow: hidden; }
         </style>
         """,
@@ -352,7 +415,7 @@ def main() -> None:
     with col_button:
         generate_clicked = st.button("✨ AIシフトを生成", use_container_width=True, type="primary")
     with col_note:
-        st.caption("夜勤→明け→休み、連続勤務5日以内、公平性を優先して自動配置します。")
+        st.caption("必要人数の充足、夜勤→明け→休み、連続勤務5日以内の順で自動配置します。")
 
     year, month = selected_month.year, selected_month.month
     key = f"{year}-{month:02d}"
@@ -378,15 +441,65 @@ def main() -> None:
     m3.metric("不足枠", f"{total_shortage}人日", f"{shortage_count}配置枠")
     m4.metric("看護師 夜勤", f"{int(nurse_nights['min'])}〜{int(nurse_nights['max'])}回", "公平性チェック")
     m5.metric("介護士 夜勤", f"{int(care_nights['min'])}〜{int(care_nights['max'])}回", "公平性チェック")
+    if shortage_count == 0:
+        st.success("全日・全勤務区分で必要人数を満たしています（不足0）。", icon="✅")
 
-    tab_schedule, tab_daily, tab_summary, tab_warning = st.tabs([
-        "📅 月間シフト表", "✅ 日別配置チェック", "👥 職員別集計", f"⚠️ 不足・警告（{len(result.warnings)}）"
-    ])
-    with tab_schedule:
+    st.markdown('<div class="section-label">シフト表示</div>', unsafe_allow_html=True)
+    view_mode = st.radio(
+        "表示形式",
+        ["月間シフト表", "日別出勤者一覧"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    if view_mode == "月間シフト表":
         legend = "".join(f'<span style="background:{color}">{shift} {SHIFT_TIMES[shift]}</span>' for shift, color in SHIFT_COLORS.items())
         st.markdown(f'<div class="legend">{legend}</div>', unsafe_allow_html=True)
         schedule_view = display_schedule(result, year, month)
         st.dataframe(style_schedule(schedule_view), use_container_width=True, height=720, hide_index=True)
+    else:
+        day_count = calendar.monthrange(year, month)[1]
+        selected_day = st.date_input(
+            "表示する日付",
+            value=date(year, month, min(date.today().day, day_count)) if (year, month) == (date.today().year, date.today().month) else date(year, month, 1),
+            min_value=date(year, month, 1),
+            max_value=date(year, month, day_count),
+            format="YYYY/MM/DD",
+            key=f"daily_roster_date_{year}_{month}",
+        )
+        st.markdown(
+            f"### {selected_day.year}年{selected_day.month}月{selected_day.day}日（{WEEKDAYS[selected_day.weekday()]}）"
+        )
+        roster = _build_daily_roster(result.schedule, result.staff, [selected_day])
+        card_columns = st.columns(3)
+        for index, row in roster.iterrows():
+            shift = row["勤務区分"]
+            nurse_names = row["看護師名"].split("、") if row["看護師名"] != "—" else []
+            care_names = row["介護士名"].split("、") if row["介護士名"] != "—" else []
+            status_class = "shortage" if row["判定"] == "不足" else ("info" if row["判定"] == "確認用" else "")
+            nurse_needed = REQUIRED["看護師"].get(shift)
+            care_needed = REQUIRED["介護士"].get(shift)
+            nurse_count = f"{len(nurse_names)}名" + (f" / 必要{nurse_needed}名" if nurse_needed is not None else "")
+            care_count = f"{len(care_names)}名" + (f" / 必要{care_needed}名" if care_needed is not None else "")
+            nurse_list = "".join(f"<li>{html.escape(name)}</li>" for name in nurse_names) or "<li>該当者なし</li>"
+            care_list = "".join(f"<li>{html.escape(name)}</li>" for name in care_names) or "<li>該当者なし</li>"
+            card_html = f"""
+            <div class="shift-card {'shortage' if row['判定'] == '不足' else ''}">
+              <span class="badge {status_class}">{row['判定']}</span>
+              <h3>{html.escape(shift)}</h3>
+              <div class="time">{html.escape(SHIFT_TIMES[shift])}</div>
+              <div class="role">看護師 <span class="staff-count">{nurse_count}</span></div>
+              <ul>{nurse_list}</ul>
+              <div class="role">介護士 <span class="staff-count">{care_count}</span></div>
+              <ul>{care_list}</ul>
+            </div>
+            """
+            with card_columns[index % 3]:
+                st.markdown(card_html, unsafe_allow_html=True)
+
+    st.markdown('<div class="section-label">配置・集計</div>', unsafe_allow_html=True)
+    tab_daily, tab_summary, tab_warning = st.tabs([
+        "✅ 日別配置チェック", "👥 職員別集計", f"⚠️ 不足・警告（{len(result.warnings)}）"
+    ])
     with tab_daily:
         daily_style = result.daily.style.map(
             lambda value: "background-color:#FEE2E2;color:#B91C1C;font-weight:700" if value == "不足" else "",
@@ -397,6 +510,8 @@ def main() -> None:
     with tab_warning:
         if (result.warnings["重要度"] == "正常").all():
             st.success("不足・警告はありません。")
+        elif not result.warnings["重要度"].isin(["不足", "警告"]).any():
+            st.warning(f"配置不足はありません。勤務条件に関する確認事項が {len(result.warnings)} 件あります。")
         else:
             st.error(f"不足または確認事項が {len(result.warnings)} 件あります。赤い項目をご確認ください。")
         warning_style = result.warnings.style.map(
@@ -414,10 +529,11 @@ def main() -> None:
     )
     with st.expander("このデモの編成ルール"):
         st.markdown(
-            "- 夜勤の翌日は必ず「明け」、その翌日は原則「休み」\n"
-            "- 連続勤務は5日以内、月休日は9日以上を目標\n"
+            "- 最優先：全日・全勤務区分で必要人数を充足\n"
+            "- 夜勤の翌日は必ず「明け」、その翌日は「休み」\n"
+            "- 連続勤務は5日以内\n"
             "- 夜勤回数と土日勤務を職種内でできるだけ均等化\n"
-            "- 必要人数を満たせない場合は、不足を隠さず警告一覧へ表示"
+            "- 月休日9日は目標値として確認事項に表示"
         )
 
 
